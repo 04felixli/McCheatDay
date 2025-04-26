@@ -4,12 +4,14 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import or_
 from sqlalchemy.orm import aliased
+from flask_cors import CORS
 import json
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('SQLALCHEMY_DATABASE_URI')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
@@ -34,12 +36,12 @@ class Category(db.Model):
 @app.route('/menu_items', methods=['GET'])
 def get_menu_items():
     # Parse query parameters
-    protein = request.args.get('protein', type=float)
-    calories = request.args.get('calories', type=float)
-    fat = request.args.get('fat', type=float)
-    carbohydrates = request.args.get('carbohydrates', type=float)
-    categories = request.args.get('categories', type=str)
-    optimize = request.args.get('optimize', type=str)
+    protein = request.args.get('protein', '', type=str)
+    calories = request.args.get('calories', '', type=str)
+    fat = request.args.get('fat', '',  type=str)
+    carbohydrates = request.args.get('carbohydrates', '', type=str)
+    categories = request.args.get('categories', '', type=str)
+    sortBy = request.args.get('sortBy', '', type=str)
 
     # Parse categories as a list if provided
     category_list = []
@@ -55,29 +57,46 @@ def get_menu_items():
     # Build the query
     query = db.session.query(NutrientInfo).join(
         category_alias, NutrientInfo.category_id == category_alias.id
-    )
+    ).filter(category_alias.name != 'DO NOT SHOW')
 
     # Apply filters
-    if protein is not None:
-        query = query.filter(NutrientInfo.protein >= protein)
-    if calories is not None:
-        query = query.filter(NutrientInfo.calories <= calories)
-    if fat is not None:
-        query = query.filter(NutrientInfo.fat <= fat)
-    if carbohydrates is not None:
-        query = query.filter(NutrientInfo.carbohydrates <= carbohydrates)
+    query = apply_range_filter(query, 'protein', protein)
+    query = apply_range_filter(query, 'calories', calories)
+    query = apply_range_filter(query, 'fat', fat)
+    query = apply_range_filter(query, 'carbohydrates', carbohydrates)
+    
     if category_list:
         query = query.filter(or_(*[category_alias.name.ilike(cat) for cat in category_list]))
-
-    # Optimize for calories
-    if optimize == 'minimize':
-        query = query.order_by(NutrientInfo.calories.asc())
-    elif optimize == 'maximize':
-        query = query.order_by(NutrientInfo.calories.desc())
     
-    # Always order by protein descending as a fallback
-    query = query.order_by(NutrientInfo.protein.desc())
+    if sortBy:
+        try:
+            sort_criteria = json.loads(sortBy)
+            order_clauses = []
+            for sort_rule in sort_criteria:
+                field = sort_rule.get('field', '').lower()
+                direction = sort_rule.get('direction', '').lower()
 
+                # Validate the field and sort direction
+                if field not in ['protein', 'calories', 'fat', 'carbohydrates']:
+                    return jsonify({"error": f"Invalid field '{field}' in sortBy parameter."}), 400
+                if direction not in ['asc', 'desc']:
+                    return jsonify({"error": f"Invalid direction '{direction}' in sortBy parameter."}), 400
+                
+                column = getattr(NutrientInfo, field)
+                if column is None:
+                    return jsonify({"error": f"Field '{field}' not found"}), 400
+                
+                if direction == 'asc':
+                    order_clauses.append(column.asc())
+                else:
+                    order_clauses.append(column.desc())
+            
+            if order_clauses:
+                query = query.order_by(*order_clauses)
+
+        except json.JSONDecodeError:
+            return jsonify({"error": "Invalid sortBy format. Must be a JSON array."}), 400
+        
     # Fetch results
     results = query.all()
 
@@ -96,6 +115,26 @@ def get_menu_items():
     ]
 
     return jsonify(menu_items)
+
+@app.route('/categories', methods=['GET'])
+def get_categories():
+    categories = db.session.query(Category).filter(Category.name != 'DO NOT SHOW').all()
+    return jsonify([category.name for category in categories])
+
+# Apply nutrient filters with min/max ranges
+def apply_range_filter(query, field_name, field_value):
+    if field_value is not None and field_value != '':
+        try:
+            field_data = json.loads(field_value)
+            min_val = field_data.get('min', float('-inf'))
+            max_val = field_data.get('max', float('inf'))
+
+            field = getattr(NutrientInfo, field_name)
+            query = query.filter(field >= min_val, field <= max_val)
+
+        except (json.JSONDecodeError, AttributeError, TypeError) as e:
+            return jsonify({"error": f"Invalid format for {field_name}. Expected JSON with 'min' and 'max'."}), 400
+    return query
 
 if __name__ == '__main__':
     app.run(debug=True)
